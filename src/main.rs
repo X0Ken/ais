@@ -1,0 +1,511 @@
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
+use toml_edit::{value, DocumentMut, Item, Table};
+
+const STORE_ENV: &str = "AIS_STORE";
+const CODEX_HOME_ENV: &str = "AIS_CODEX_HOME";
+const DEFAULT_STORE_REL: &str = ".config/ais/codex-auth.json";
+const DEFAULT_WIRE_API: &str = "responses";
+
+#[derive(Parser)]
+#[command(
+    name = "ais",
+    version,
+    about = "Switch AI agent authentication profiles"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Manage Codex authentication profiles.
+    Codex(CodexArgs),
+}
+
+#[derive(Parser)]
+struct CodexArgs {
+    #[command(subcommand)]
+    command: CodexCommand,
+}
+
+#[derive(Subcommand)]
+enum CodexCommand {
+    /// Save current Codex authentication as a named profile.
+    Save {
+        /// Profile name to save.
+        name: String,
+    },
+    /// Switch to a saved Codex authentication profile.
+    Switch {
+        /// Profile name to switch to.
+        name: String,
+    },
+    /// List saved Codex authentication profiles.
+    List,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Store {
+    version: u32,
+    #[serde(default)]
+    codex: BTreeMap<String, CodexProfile>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            codex: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexProfile {
+    auth: JsonValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_config: Option<AuthConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AuthConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preferred_auth_method: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    model_providers: BTreeMap<String, ProviderConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProviderConfig {
+    name: String,
+    base_url: String,
+    wire_api: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthKind {
+    OpenAiLogin,
+    ApiKey,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Codex(args) => run_codex(args.command),
+    }
+}
+
+fn run_codex(command: CodexCommand) -> Result<()> {
+    let store_path = store_path()?;
+    let codex_home = codex_home()?;
+    let codex_auth_path = codex_home.join("auth.json");
+    let codex_config_path = codex_home.join("config.toml");
+
+    match command {
+        CodexCommand::Switch { name } => {
+            let store = load_store(&store_path)?;
+            let profile = store.codex.get(&name).ok_or_else(|| {
+                anyhow!(
+                    "codex profile '{name}' not found; run `ais codex list` to see saved profiles"
+                )
+            })?;
+            apply_profile(profile, &codex_auth_path, &codex_config_path)?;
+            println!("switched codex authentication to profile '{name}'");
+        }
+        CodexCommand::Save { name } => {
+            let profile = capture_current_profile(&codex_auth_path, &codex_config_path)
+                .with_context(|| "failed to capture current Codex authentication")?;
+            let mut store = load_store(&store_path)?;
+            store.codex.insert(name.clone(), profile);
+            save_store(&store_path, &store)?;
+            println!("saved codex authentication profile '{name}'");
+        }
+        CodexCommand::List => {
+            let store = load_store(&store_path)?;
+            for (name, profile) in store.codex {
+                println!("{name}\t{}", profile_kind(&profile));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn store_path() -> Result<PathBuf> {
+    if let Some(path) = env::var_os(STORE_ENV) {
+        return Ok(PathBuf::from(path));
+    }
+
+    let home = home_dir()?;
+    Ok(home.join(DEFAULT_STORE_REL))
+}
+
+fn codex_home() -> Result<PathBuf> {
+    if let Some(path) = env::var_os(CODEX_HOME_ENV) {
+        return Ok(PathBuf::from(path));
+    }
+
+    Ok(home_dir()?.join(".codex"))
+}
+
+fn home_dir() -> Result<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| anyhow!("HOME is not set"))
+}
+
+fn load_store(path: &Path) -> Result<Store> {
+    if !path.exists() {
+        return Ok(Store::default());
+    }
+
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read store {}", path.display()))?;
+    serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse store {}", path.display()))
+}
+
+fn save_store(path: &Path, store: &Store) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create store directory {}", parent.display()))?;
+    }
+
+    let contents = serde_json::to_string_pretty(store)?;
+    fs::write(path, format!("{contents}\n"))
+        .with_context(|| format!("failed to write store {}", path.display()))
+}
+
+fn capture_current_profile(auth_path: &Path, config_path: &Path) -> Result<CodexProfile> {
+    let auth_contents = fs::read_to_string(auth_path)
+        .with_context(|| format!("failed to read {}", auth_path.display()))?;
+    let auth = serde_json::from_str(&auth_contents)
+        .with_context(|| format!("failed to parse {}", auth_path.display()))?;
+    let auth_config = capture_auth_config(config_path)?;
+
+    Ok(CodexProfile { auth, auth_config })
+}
+
+fn capture_auth_config(config_path: &Path) -> Result<Option<AuthConfig>> {
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let doc = contents
+        .parse::<DocumentMut>()
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+
+    let model_provider = doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(ToOwned::to_owned);
+    let preferred_auth_method = doc
+        .get("preferred_auth_method")
+        .and_then(|item| item.as_str())
+        .map(ToOwned::to_owned);
+
+    let mut model_providers = BTreeMap::new();
+    if let Some(model_provider) = &model_provider {
+        if let Some(provider) = doc
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(model_provider))
+            .and_then(Item::as_table)
+            .and_then(|table| provider_from_table(model_provider, table))
+        {
+            model_providers.insert(model_provider.clone(), provider);
+        }
+    }
+
+    if model_provider.is_none() && preferred_auth_method.is_none() && model_providers.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(AuthConfig {
+        model_provider,
+        preferred_auth_method,
+        model_providers,
+    }))
+}
+
+fn provider_from_table(table_name: &str, table: &Table) -> Option<ProviderConfig> {
+    let base_url = table.get("base_url")?.as_str()?.to_string();
+    Some(ProviderConfig {
+        name: table
+            .get("name")
+            .and_then(|item| item.as_str())
+            .unwrap_or(table_name)
+            .to_string(),
+        base_url,
+        wire_api: table
+            .get("wire_api")
+            .and_then(|item| item.as_str())
+            .unwrap_or(DEFAULT_WIRE_API)
+            .to_string(),
+    })
+}
+
+fn apply_profile(profile: &CodexProfile, auth_path: &Path, config_path: &Path) -> Result<()> {
+    if let Some(parent) = auth_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create Codex directory {}", parent.display()))?;
+    }
+
+    write_json(auth_path, &profile.auth)?;
+    update_codex_config(
+        config_path,
+        profile.auth_config.as_ref(),
+        auth_kind(&profile.auth),
+    )?;
+    Ok(())
+}
+
+fn write_json(path: &Path, value: &JsonValue) -> Result<()> {
+    let contents = serde_json::to_string_pretty(value)?;
+    fs::write(path, format!("{contents}\n"))
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn update_codex_config(
+    config_path: &Path,
+    auth_config: Option<&AuthConfig>,
+    auth_kind: AuthKind,
+) -> Result<()> {
+    let mut doc = if config_path.exists() {
+        let contents = fs::read_to_string(config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        contents
+            .parse::<DocumentMut>()
+            .with_context(|| format!("failed to parse {}", config_path.display()))?
+    } else {
+        DocumentMut::new()
+    };
+
+    remove_auth_config(&mut doc);
+
+    match (auth_config, auth_kind) {
+        (Some(auth_config), _) => apply_auth_config(&mut doc, auth_config),
+        (None, AuthKind::ApiKey) => {
+            bail!("API key profile is missing provider configuration")
+        }
+        (None, AuthKind::OpenAiLogin) => {}
+    }
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create Codex directory {}", parent.display()))?;
+    }
+
+    fs::write(config_path, doc.to_string())
+        .with_context(|| format!("failed to write {}", config_path.display()))
+}
+
+fn remove_auth_config(doc: &mut DocumentMut) {
+    doc.remove("model_provider");
+    doc.remove("preferred_auth_method");
+}
+
+fn apply_auth_config(doc: &mut DocumentMut, auth_config: &AuthConfig) {
+    if let Some(model_provider) = &auth_config.model_provider {
+        doc["model_provider"] = value(model_provider);
+    }
+    if let Some(preferred_auth_method) = &auth_config.preferred_auth_method {
+        doc["preferred_auth_method"] = value(preferred_auth_method);
+    }
+    if !auth_config.model_providers.is_empty() {
+        if !doc.contains_key("model_providers") {
+            let mut table = Table::new();
+            table.set_implicit(true);
+            doc["model_providers"] = Item::Table(table);
+        }
+        let Some(providers) = doc["model_providers"].as_table_mut() else {
+            let mut table = Table::new();
+            table.set_implicit(true);
+            doc["model_providers"] = Item::Table(table);
+            let Some(providers) = doc["model_providers"].as_table_mut() else {
+                return;
+            };
+            for (name, provider) in &auth_config.model_providers {
+                let mut table = Table::new();
+                table["name"] = value(&provider.name);
+                table["base_url"] = value(&provider.base_url);
+                table["wire_api"] = value(&provider.wire_api);
+                providers[name] = Item::Table(table);
+            }
+            return;
+        };
+        for (name, provider) in &auth_config.model_providers {
+            let mut table = Table::new();
+            table["name"] = value(&provider.name);
+            table["base_url"] = value(&provider.base_url);
+            table["wire_api"] = value(&provider.wire_api);
+            providers[name] = Item::Table(table);
+        }
+    }
+}
+
+fn auth_kind(auth: &JsonValue) -> AuthKind {
+    let has_tokens = auth
+        .get("tokens")
+        .and_then(JsonValue::as_object)
+        .is_some_and(|tokens| !tokens.is_empty());
+    if has_tokens {
+        return AuthKind::OpenAiLogin;
+    }
+
+    match auth.get("auth_mode").and_then(JsonValue::as_str) {
+        Some("chatgpt") | Some("oauth") | Some("login") => AuthKind::OpenAiLogin,
+        _ => AuthKind::ApiKey,
+    }
+}
+
+fn profile_kind(profile: &CodexProfile) -> &'static str {
+    match auth_kind(&profile.auth) {
+        AuthKind::OpenAiLogin => "openai",
+        AuthKind::ApiKey => "apikey",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn switch_to_openai_removes_auth_related_config_only() {
+        let dir = tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"model = "gpt-5.5"
+model_provider = "api111"
+preferred_auth_method = "apikey"
+model_reasoning_effort = "xhigh"
+
+[projects."/root/code/ais"]
+trust_level = "trusted"
+
+[model_providers.api111]
+name = "api111"
+base_url = "https://api.example.com"
+wire_api = "responses"
+"#,
+        )
+        .unwrap();
+
+        let profile = CodexProfile {
+            auth: serde_json::json!({
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": null,
+                "tokens": { "access_token": "a" },
+                "last_refresh": "2026-05-25T00:00:00Z"
+            }),
+            auth_config: None,
+        };
+
+        apply_profile(&profile, &auth_path, &config_path).unwrap();
+
+        let config = fs::read_to_string(config_path).unwrap();
+        let doc = config.parse::<DocumentMut>().unwrap();
+        assert!(config.contains(r#"model = "gpt-5.5""#));
+        assert!(config.contains(r#"model_reasoning_effort = "xhigh""#));
+        assert!(config.contains(r#"[projects."/root/code/ais"]"#));
+        assert!(doc.get("model_provider").is_none());
+        assert!(doc.get("preferred_auth_method").is_none());
+        assert!(config.contains(r#"[model_providers.api111]"#));
+        assert!(config.contains(r#"base_url = "https://api.example.com""#));
+    }
+
+    #[test]
+    fn switch_to_apikey_profile_updates_only_auth_related_config() {
+        let dir = tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+
+[projects."/root/code/ais"]
+trust_level = "trusted"
+"#,
+        )
+        .unwrap();
+
+        let profile = CodexProfile {
+            auth: serde_json::json!({ "OPENAI_API_KEY": "abc" }),
+            auth_config: Some(AuthConfig {
+                model_provider: Some("api111".to_string()),
+                preferred_auth_method: Some("apikey".to_string()),
+                model_providers: BTreeMap::from([(
+                    "api111".to_string(),
+                    ProviderConfig {
+                        name: "api111".to_string(),
+                        base_url: "https://api.example.com".to_string(),
+                        wire_api: "responses".to_string(),
+                    },
+                )]),
+            }),
+        };
+        apply_profile(&profile, &auth_path, &config_path).unwrap();
+
+        let auth: JsonValue =
+            serde_json::from_str(&fs::read_to_string(auth_path).unwrap()).unwrap();
+        assert_eq!(auth["OPENAI_API_KEY"], "abc");
+
+        let config = fs::read_to_string(config_path).unwrap();
+        assert!(config.contains(r#"model = "gpt-5.5""#));
+        assert!(config.contains(r#"model_provider = "api111""#));
+        assert!(config.contains(r#"preferred_auth_method = "apikey""#));
+        assert!(config.contains(r#"[model_providers.api111]"#));
+        assert!(config.contains(r#"base_url = "https://api.example.com""#));
+        assert!(config.contains(r#"[projects."/root/code/ais"]"#));
+    }
+
+    #[test]
+    fn capture_auth_config_reads_provider_tables() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"model = "gpt-5.5"
+model_provider = "api111"
+preferred_auth_method = "apikey"
+
+[model_providers.api111]
+name = "api111"
+base_url = "https://api.example.com"
+wire_api = "responses"
+"#,
+        )
+        .unwrap();
+
+        let config = capture_auth_config(&config_path).unwrap().unwrap();
+        assert_eq!(config.model_provider.as_deref(), Some("api111"));
+        assert_eq!(config.preferred_auth_method.as_deref(), Some("apikey"));
+        assert_eq!(
+            config.model_providers["api111"],
+            ProviderConfig {
+                name: "api111".to_string(),
+                base_url: "https://api.example.com".to_string(),
+                wire_api: "responses".to_string()
+            }
+        );
+    }
+}
