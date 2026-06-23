@@ -34,6 +34,18 @@ Save the current `~/.codex` authentication as a named profile:
 ais codex save <name>
 ```
 
+Create and switch to a Codex API key provider profile:
+
+```bash
+ais codex create <base-url> <api-key>
+```
+
+You can choose the saved profile/provider name explicitly:
+
+```bash
+ais codex create --name <name> <base-url> <api-key>
+```
+
 Switch Codex to a saved profile:
 
 ```bash

@@ -39,6 +39,16 @@ struct CodexArgs {
 
 #[derive(Subcommand)]
 enum CodexCommand {
+    /// Create a Codex API key provider profile and switch to it.
+    Create {
+        /// Optional profile/provider name. Defaults to a name derived from the base URL.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Provider base URL, such as https://api.example.com/v1.
+        base_url: String,
+        /// API key for the provider.
+        api_key: String,
+    },
     /// Save current Codex authentication as a named profile.
     Save {
         /// Profile name to save.
@@ -114,6 +124,18 @@ fn run_codex(command: CodexCommand) -> Result<()> {
     let codex_config_path = codex_home.join("config.toml");
 
     match command {
+        CodexCommand::Create {
+            name,
+            base_url,
+            api_key,
+        } => {
+            let (name, profile) = create_provider_profile(name.as_deref(), &base_url, &api_key)?;
+            let mut store = load_store(&store_path)?;
+            store.codex.insert(name.clone(), profile.clone());
+            save_store(&store_path, &store)?;
+            apply_profile(&profile, &codex_auth_path, &codex_config_path)?;
+            println!("created and switched codex provider profile '{name}'");
+        }
         CodexCommand::Switch { name } => {
             let store = load_store(&store_path)?;
             let profile = store.codex.get(&name).ok_or_else(|| {
@@ -258,6 +280,97 @@ fn provider_from_table(table_name: &str, table: &Table) -> Option<ProviderConfig
             .unwrap_or(DEFAULT_WIRE_API)
             .to_string(),
     })
+}
+
+fn create_provider_profile(
+    name: Option<&str>,
+    base_url: &str,
+    api_key: &str,
+) -> Result<(String, CodexProfile)> {
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        bail!("provider base URL cannot be empty");
+    }
+
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        bail!("provider API key cannot be empty");
+    }
+
+    let provider_name = match name {
+        Some(name) => normalize_provider_name(name)?,
+        None => provider_name_from_base_url(base_url)?,
+    };
+
+    let profile = CodexProfile {
+        auth: serde_json::json!({ "OPENAI_API_KEY": api_key }),
+        auth_config: Some(AuthConfig {
+            model_provider: Some(provider_name.clone()),
+            preferred_auth_method: Some("apikey".to_string()),
+            model_providers: BTreeMap::from([(
+                provider_name.clone(),
+                ProviderConfig {
+                    name: provider_name.clone(),
+                    base_url: base_url.to_string(),
+                    wire_api: DEFAULT_WIRE_API.to_string(),
+                },
+            )]),
+        }),
+    };
+
+    Ok((provider_name, profile))
+}
+
+fn provider_name_from_base_url(base_url: &str) -> Result<String> {
+    let without_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split_once(']')
+            .map(|(host, _)| host)
+            .unwrap_or(host_port)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+
+    let mut labels = host.split('.').filter(|label| !label.is_empty());
+    let first = labels.next().unwrap_or(host);
+    let candidate = if first.eq_ignore_ascii_case("api") {
+        labels.next().unwrap_or(first)
+    } else {
+        first
+    };
+
+    normalize_provider_name(candidate)
+        .with_context(|| format!("failed to derive provider name from base URL '{base_url}'"))
+}
+
+fn normalize_provider_name(name: &str) -> Result<String> {
+    let mut normalized = String::new();
+    let mut previous_dash = false;
+
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            previous_dash = false;
+        } else if !previous_dash {
+            normalized.push('-');
+            previous_dash = true;
+        }
+    }
+
+    let normalized = normalized.trim_matches('-').to_string();
+    if normalized.is_empty() {
+        bail!("provider name cannot be empty");
+    }
+
+    Ok(normalized)
 }
 
 fn apply_profile(profile: &CodexProfile, auth_path: &Path, config_path: &Path) -> Result<()> {
@@ -506,6 +619,43 @@ wire_api = "responses"
                 base_url: "https://api.example.com".to_string(),
                 wire_api: "responses".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn create_provider_profile_derives_name_from_base_url() {
+        let (name, profile) =
+            create_provider_profile(None, "https://api.example.test/v1", "xxkey").unwrap();
+
+        assert_eq!(name, "example");
+        assert_eq!(
+            profile.auth,
+            serde_json::json!({ "OPENAI_API_KEY": "xxkey" })
+        );
+
+        let auth_config = profile.auth_config.unwrap();
+        assert_eq!(auth_config.model_provider.as_deref(), Some("example"));
+        assert_eq!(auth_config.preferred_auth_method.as_deref(), Some("apikey"));
+        assert_eq!(
+            auth_config.model_providers["example"],
+            ProviderConfig {
+                name: "example".to_string(),
+                base_url: "https://api.example.test/v1".to_string(),
+                wire_api: "responses".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn create_provider_profile_uses_explicit_name() {
+        let (name, profile) =
+            create_provider_profile(Some("DeepSeek API"), "https://api.deepseek.com/v1", "xxkey")
+                .unwrap();
+
+        assert_eq!(name, "deepseek-api");
+        assert_eq!(
+            profile.auth_config.unwrap().model_providers["deepseek-api"].base_url,
+            "https://api.deepseek.com/v1"
         );
     }
 }
