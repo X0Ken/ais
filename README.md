@@ -1,7 +1,8 @@
 # ais
 
 `ais` is a small command-line tool for switching AI agent authentication
-profiles. It currently supports Codex authentication profiles.
+profiles. It supports Codex authentication profiles and Claude Code
+environment profiles.
 
 ## Install
 
@@ -67,11 +68,83 @@ ais codex delete <name>
 Examples:
 
 ```bash
-ais codex switch openai
-ais codex switch wan
+ais codex switch example-login
+ais codex switch example-api
 ```
 
 `switch` works the same way for OpenAI login profiles and API key profiles.
+
+## Claude Code
+
+Create a Claude Code environment profile:
+
+```bash
+ais claude create https://api.example.com/v1 <auth-token>
+```
+
+You can choose the saved profile name explicitly:
+
+```bash
+ais claude create --name example https://api.example.com/v1 <auth-token>
+```
+
+For custom model providers, include model environment settings in the saved
+profile:
+
+```bash
+ais claude create \
+  --name example \
+  --default-model example-pro \
+  --haiku-model example-flash \
+  --subagent-model example-flash \
+  --effort-level max \
+  https://api.example.com/anthropic \
+  <auth-token>
+```
+
+`--default-model` sets `ANTHROPIC_MODEL`,
+`ANTHROPIC_DEFAULT_OPUS_MODEL`, and `ANTHROPIC_DEFAULT_SONNET_MODEL`
+together. More specific flags such as `--model`, `--opus-model`, and
+`--sonnet-model` override it.
+
+Save the current Claude Code environment variables as a named profile:
+
+```bash
+ais claude save example
+```
+
+Apply a saved Claude Code environment profile to the current shell:
+
+```bash
+eval "$(ais claude env example)"
+```
+
+`env` prints shell exports for:
+
+```text
+ANTHROPIC_BASE_URL
+ANTHROPIC_AUTH_TOKEN
+ANTHROPIC_MODEL
+ANTHROPIC_DEFAULT_OPUS_MODEL
+ANTHROPIC_DEFAULT_SONNET_MODEL
+ANTHROPIC_DEFAULT_HAIKU_MODEL
+CLAUDE_CODE_SUBAGENT_MODEL
+CLAUDE_CODE_EFFORT_LEVEL
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+CLAUDE_CODE_ATTRIBUTION_HEADER
+```
+
+List saved Claude Code profiles:
+
+```bash
+ais claude list
+```
+
+Delete a saved Claude Code profile:
+
+```bash
+ais claude delete <name>
+```
 
 ## Storage
 
