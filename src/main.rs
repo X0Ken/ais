@@ -44,6 +44,9 @@ enum CodexCommand {
         /// Optional profile/provider name. Defaults to a name derived from the base URL.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// Enable Codex responses websocket support for this provider profile.
+        #[arg(long = "websocket", visible_alias = "ws")]
+        websocket: bool,
         /// Provider base URL, such as https://api.example.com/v1.
         base_url: String,
         /// API key for the provider.
@@ -94,6 +97,8 @@ struct AuthConfig {
     preferred_auth_method: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     model_providers: BTreeMap<String, ProviderConfig>,
+    #[serde(default, skip_serializing_if = "FeatureConfig::is_empty")]
+    features: FeatureConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +106,22 @@ struct ProviderConfig {
     name: String,
     base_url: String,
     wire_api: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supports_websockets: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requires_openai_auth: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct FeatureConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    responses_websockets_v2: Option<bool>,
+}
+
+impl FeatureConfig {
+    fn is_empty(&self) -> bool {
+        self.responses_websockets_v2.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,10 +147,12 @@ fn run_codex(command: CodexCommand) -> Result<()> {
     match command {
         CodexCommand::Create {
             name,
+            websocket,
             base_url,
             api_key,
         } => {
-            let (name, profile) = create_provider_profile(name.as_deref(), &base_url, &api_key)?;
+            let (name, profile) =
+                create_provider_profile(name.as_deref(), &base_url, &api_key, websocket)?;
             let mut store = load_store(&store_path)?;
             store.codex.insert(name.clone(), profile.clone());
             save_store(&store_path, &store)?;
@@ -253,8 +276,13 @@ fn capture_auth_config(config_path: &Path) -> Result<Option<AuthConfig>> {
             model_providers.insert(model_provider.clone(), provider);
         }
     }
+    let features = features_from_doc(&doc);
 
-    if model_provider.is_none() && preferred_auth_method.is_none() && model_providers.is_empty() {
+    if model_provider.is_none()
+        && preferred_auth_method.is_none()
+        && model_providers.is_empty()
+        && features.is_empty()
+    {
         return Ok(None);
     }
 
@@ -262,6 +290,7 @@ fn capture_auth_config(config_path: &Path) -> Result<Option<AuthConfig>> {
         model_provider,
         preferred_auth_method,
         model_providers,
+        features,
     }))
 }
 
@@ -279,13 +308,29 @@ fn provider_from_table(table_name: &str, table: &Table) -> Option<ProviderConfig
             .and_then(|item| item.as_str())
             .unwrap_or(DEFAULT_WIRE_API)
             .to_string(),
+        supports_websockets: table
+            .get("supports_websockets")
+            .and_then(|item| item.as_bool()),
+        requires_openai_auth: table
+            .get("requires_openai_auth")
+            .and_then(|item| item.as_bool()),
     })
+}
+
+fn features_from_doc(doc: &DocumentMut) -> FeatureConfig {
+    let features = doc.get("features").and_then(Item::as_table);
+    FeatureConfig {
+        responses_websockets_v2: features
+            .and_then(|table| table.get("responses_websockets_v2"))
+            .and_then(|item| item.as_bool()),
+    }
 }
 
 fn create_provider_profile(
     name: Option<&str>,
     base_url: &str,
     api_key: &str,
+    websocket: bool,
 ) -> Result<(String, CodexProfile)> {
     let base_url = base_url.trim();
     if base_url.is_empty() {
@@ -313,8 +358,13 @@ fn create_provider_profile(
                     name: provider_name.clone(),
                     base_url: base_url.to_string(),
                     wire_api: DEFAULT_WIRE_API.to_string(),
+                    supports_websockets: websocket.then_some(true),
+                    requires_openai_auth: Some(true),
                 },
             )]),
+            features: FeatureConfig {
+                responses_websockets_v2: websocket.then_some(true),
+            },
         }),
     };
 
@@ -431,6 +481,9 @@ fn update_codex_config(
 fn remove_auth_config(doc: &mut DocumentMut) {
     doc.remove("model_provider");
     doc.remove("preferred_auth_method");
+    if let Some(features) = doc.get_mut("features").and_then(Item::as_table_mut) {
+        features.remove("responses_websockets_v2");
+    }
 }
 
 fn apply_auth_config(doc: &mut DocumentMut, auth_config: &AuthConfig) {
@@ -458,6 +511,12 @@ fn apply_auth_config(doc: &mut DocumentMut, auth_config: &AuthConfig) {
                 table["name"] = value(&provider.name);
                 table["base_url"] = value(&provider.base_url);
                 table["wire_api"] = value(&provider.wire_api);
+                if let Some(supports_websockets) = provider.supports_websockets {
+                    table["supports_websockets"] = value(supports_websockets);
+                }
+                if let Some(requires_openai_auth) = provider.requires_openai_auth {
+                    table["requires_openai_auth"] = value(requires_openai_auth);
+                }
                 providers[name] = Item::Table(table);
             }
             return;
@@ -467,8 +526,32 @@ fn apply_auth_config(doc: &mut DocumentMut, auth_config: &AuthConfig) {
             table["name"] = value(&provider.name);
             table["base_url"] = value(&provider.base_url);
             table["wire_api"] = value(&provider.wire_api);
+            if let Some(supports_websockets) = provider.supports_websockets {
+                table["supports_websockets"] = value(supports_websockets);
+            }
+            if let Some(requires_openai_auth) = provider.requires_openai_auth {
+                table["requires_openai_auth"] = value(requires_openai_auth);
+            }
             providers[name] = Item::Table(table);
         }
+    }
+    apply_feature_config(doc, &auth_config.features);
+}
+
+fn apply_feature_config(doc: &mut DocumentMut, features: &FeatureConfig) {
+    if features.is_empty() {
+        return;
+    }
+
+    if !doc.contains_key("features") || !doc["features"].is_table() {
+        doc["features"] = Item::Table(Table::new());
+    }
+
+    let Some(features_table) = doc["features"].as_table_mut() else {
+        return;
+    };
+    if let Some(responses_websockets_v2) = features.responses_websockets_v2 {
+        features_table["responses_websockets_v2"] = value(responses_websockets_v2);
     }
 }
 
@@ -572,8 +655,11 @@ trust_level = "trusted"
                         name: "api111".to_string(),
                         base_url: "https://api.example.com".to_string(),
                         wire_api: "responses".to_string(),
+                        supports_websockets: None,
+                        requires_openai_auth: None,
                     },
                 )]),
+                features: FeatureConfig::default(),
             }),
         };
         apply_profile(&profile, &auth_path, &config_path).unwrap();
@@ -617,15 +703,18 @@ wire_api = "responses"
             ProviderConfig {
                 name: "api111".to_string(),
                 base_url: "https://api.example.com".to_string(),
-                wire_api: "responses".to_string()
+                wire_api: "responses".to_string(),
+                supports_websockets: None,
+                requires_openai_auth: None
             }
         );
+        assert!(config.features.is_empty());
     }
 
     #[test]
     fn create_provider_profile_derives_name_from_base_url() {
         let (name, profile) =
-            create_provider_profile(None, "https://api.example.test/v1", "xxkey").unwrap();
+            create_provider_profile(None, "https://api.example.test/v1", "xxkey", false).unwrap();
 
         assert_eq!(name, "example");
         assert_eq!(
@@ -641,21 +730,146 @@ wire_api = "responses"
             ProviderConfig {
                 name: "example".to_string(),
                 base_url: "https://api.example.test/v1".to_string(),
-                wire_api: "responses".to_string()
+                wire_api: "responses".to_string(),
+                supports_websockets: None,
+                requires_openai_auth: Some(true)
             }
         );
+        assert!(auth_config.features.is_empty());
     }
 
     #[test]
     fn create_provider_profile_uses_explicit_name() {
-        let (name, profile) =
-            create_provider_profile(Some("DeepSeek API"), "https://api.deepseek.com/v1", "xxkey")
-                .unwrap();
+        let (name, profile) = create_provider_profile(
+            Some("Example API"),
+            "https://api.example.com/v1",
+            "xxkey",
+            false,
+        )
+        .unwrap();
 
-        assert_eq!(name, "deepseek-api");
+        assert_eq!(name, "example-api");
         assert_eq!(
-            profile.auth_config.unwrap().model_providers["deepseek-api"].base_url,
-            "https://api.deepseek.com/v1"
+            profile.auth_config.unwrap().model_providers["example-api"].base_url,
+            "https://api.example.com/v1"
         );
+    }
+
+    #[test]
+    fn capture_auth_config_reads_websocket_fields() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"model = "gpt-5.5"
+model_provider = "OpenAI"
+preferred_auth_method = "apikey"
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "https://api.example.com"
+wire_api = "responses"
+supports_websockets = true
+requires_openai_auth = true
+
+[features]
+responses_websockets_v2 = true
+goals = true
+"#,
+        )
+        .unwrap();
+
+        let config = capture_auth_config(&config_path).unwrap().unwrap();
+        assert_eq!(config.model_provider.as_deref(), Some("OpenAI"));
+        assert_eq!(
+            config.model_providers["OpenAI"],
+            ProviderConfig {
+                name: "OpenAI".to_string(),
+                base_url: "https://api.example.com".to_string(),
+                wire_api: "responses".to_string(),
+                supports_websockets: Some(true),
+                requires_openai_auth: Some(true),
+            }
+        );
+        assert_eq!(config.features.responses_websockets_v2, Some(true));
+    }
+
+    #[test]
+    fn switch_to_websocket_profile_writes_websocket_config() {
+        let dir = tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"model = "gpt-5.5"
+
+[features]
+goals = true
+"#,
+        )
+        .unwrap();
+
+        let (_, profile) =
+            create_provider_profile(Some("OpenAI"), "https://api.example.com", "xxkey", true)
+                .unwrap();
+        apply_profile(&profile, &auth_path, &config_path).unwrap();
+
+        let config = fs::read_to_string(config_path).unwrap();
+        assert!(config.contains(r#"supports_websockets = true"#));
+        assert!(config.contains(r#"requires_openai_auth = true"#));
+        assert!(config.contains(r#"responses_websockets_v2 = true"#));
+        assert!(config.contains(r#"goals = true"#));
+    }
+
+    #[test]
+    fn switch_to_non_websocket_profile_removes_websocket_feature_only() {
+        let dir = tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"model = "gpt-5.5"
+model_provider = "OpenAI"
+preferred_auth_method = "apikey"
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "https://api.example.com"
+wire_api = "responses"
+supports_websockets = true
+requires_openai_auth = true
+
+[features]
+responses_websockets_v2 = true
+goals = true
+"#,
+        )
+        .unwrap();
+
+        let profile = CodexProfile {
+            auth: serde_json::json!({ "OPENAI_API_KEY": "xxkey" }),
+            auth_config: Some(AuthConfig {
+                model_provider: Some("OpenAI".to_string()),
+                preferred_auth_method: Some("apikey".to_string()),
+                model_providers: BTreeMap::from([(
+                    "OpenAI".to_string(),
+                    ProviderConfig {
+                        name: "OpenAI".to_string(),
+                        base_url: "https://api.example.com".to_string(),
+                        wire_api: "responses".to_string(),
+                        supports_websockets: None,
+                        requires_openai_auth: Some(true),
+                    },
+                )]),
+                features: FeatureConfig::default(),
+            }),
+        };
+        apply_profile(&profile, &auth_path, &config_path).unwrap();
+
+        let config = fs::read_to_string(config_path).unwrap();
+        assert!(!config.contains(r#"supports_websockets = true"#));
+        assert!(!config.contains(r#"responses_websockets_v2 = true"#));
+        assert!(config.contains(r#"requires_openai_auth = true"#));
+        assert!(config.contains(r#"goals = true"#));
     }
 }

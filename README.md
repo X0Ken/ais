@@ -46,6 +46,13 @@ You can choose the saved profile/provider name explicitly:
 ais codex create --name <name> <base-url> <api-key>
 ```
 
+Enable Codex responses websocket support for a provider profile:
+
+```bash
+ais codex create --websocket --name <name> <base-url> <api-key>
+ais codex create --ws --name <name> <base-url> <api-key>
+```
+
 Switch Codex to a saved profile:
 
 ```bash
@@ -89,5 +96,6 @@ settings:
 - `model_provider`
 - `preferred_auth_method`
 - the selected provider entry under `model_providers`
+- `responses_websockets_v2` under `features`
 
 Other Codex configuration is preserved.
