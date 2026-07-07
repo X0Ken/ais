@@ -59,6 +59,12 @@ Switch Codex to a saved profile:
 ais codex switch <name>
 ```
 
+Delete a saved Codex profile:
+
+```bash
+ais codex delete <name>
+```
+
 Examples:
 
 ```bash

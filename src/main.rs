@@ -62,6 +62,11 @@ enum CodexCommand {
         /// Profile name to switch to.
         name: String,
     },
+    /// Delete a saved Codex authentication profile.
+    Delete {
+        /// Profile name to delete.
+        name: String,
+    },
     /// List saved Codex authentication profiles.
     List,
 }
@@ -168,6 +173,10 @@ fn run_codex(command: CodexCommand) -> Result<()> {
             })?;
             apply_profile(profile, &codex_auth_path, &codex_config_path)?;
             println!("switched codex authentication to profile '{name}'");
+        }
+        CodexCommand::Delete { name } => {
+            delete_codex_profile(&store_path, &name)?;
+            println!("deleted codex authentication profile '{name}'");
         }
         CodexCommand::Save { name } => {
             let profile = capture_current_profile(&codex_auth_path, &codex_config_path)
@@ -577,6 +586,14 @@ fn profile_kind(profile: &CodexProfile) -> &'static str {
     }
 }
 
+fn delete_codex_profile(store_path: &Path, name: &str) -> Result<()> {
+    let mut store = load_store(store_path)?;
+    if store.codex.remove(name).is_none() {
+        bail!("codex profile '{name}' not found; run `ais codex list` to see saved profiles");
+    }
+    save_store(store_path, &store)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +769,63 @@ wire_api = "responses"
         assert_eq!(
             profile.auth_config.unwrap().model_providers["example-api"].base_url,
             "https://api.example.com/v1"
+        );
+    }
+
+    #[test]
+    fn delete_codex_profile_removes_saved_profile() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("store.json");
+        let store = Store {
+            version: 1,
+            codex: BTreeMap::from([
+                (
+                    "first".to_string(),
+                    CodexProfile {
+                        auth: serde_json::json!({ "OPENAI_API_KEY": "first-key" }),
+                        auth_config: None,
+                    },
+                ),
+                (
+                    "second".to_string(),
+                    CodexProfile {
+                        auth: serde_json::json!({ "OPENAI_API_KEY": "second-key" }),
+                        auth_config: None,
+                    },
+                ),
+            ]),
+        };
+        save_store(&store_path, &store).unwrap();
+
+        delete_codex_profile(&store_path, "first").unwrap();
+
+        let store = load_store(&store_path).unwrap();
+        assert!(!store.codex.contains_key("first"));
+        assert!(store.codex.contains_key("second"));
+    }
+
+    #[test]
+    fn delete_codex_profile_errors_for_missing_profile() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("store.json");
+        save_store(&store_path, &Store::default()).unwrap();
+
+        let error = delete_codex_profile(&store_path, "missing").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "codex profile 'missing' not found; run `ais codex list` to see saved profiles"
+        );
+    }
+
+    #[test]
+    fn delete_command_requires_profile_name() {
+        let error = match Cli::try_parse_from(["ais", "codex", "delete"]) {
+            Ok(_) => panic!("delete without a profile name should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         );
     }
 
