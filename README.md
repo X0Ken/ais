@@ -3,9 +3,6 @@
 `ais` is a small command-line tool for switching AI agent authentication
 profiles. It currently supports Codex authentication profiles.
 
-The tool stores saved authentication profiles in one JSON file instead of using
-multiple `/root/.codex.*` directories.
-
 ## Install
 
 From this repository:
@@ -19,6 +16,8 @@ Make sure Cargo's bin directory is in your `PATH`:
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
+
+Linux release binaries are built with the `x86_64-unknown-linux-musl` target.
 
 ## Usage
 

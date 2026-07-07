@@ -20,12 +20,15 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
 
+      - name: Install musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
 
       - name: Package
         run: |
-          install -Dm755 target/release/ais dist/ais-linux-x86_64
+          install -Dm755 target/x86_64-unknown-linux-musl/release/ais dist/ais-linux-x86_64
           sha256sum dist/ais-linux-x86_64 > dist/ais-linux-x86_64.sha256
 
       - name: Publish release
